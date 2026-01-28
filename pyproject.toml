@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mcp-finance"
+version = "0.1.0"
+description = "MCP server for financial data - stock prices, technical analysis, and market news"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Edwin Isac", email = "edwinisac007@gmail.com" }
+]
+keywords = ["mcp", "finance", "stocks", "trading", "ai", "llm", "claude"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "yfinance>=0.2.36",
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+]
+
+[project.scripts]
+mcp-finance = "server:main"
+
+[project.urls]
+Homepage = "https://github.com/edwiniac/mcp-finance"
+Repository = "https://github.com/edwiniac/mcp-finance"
+Issues = "https://github.com/edwiniac/mcp-finance/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
