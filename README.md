@@ -1,5 +1,6 @@
 # 📈 MCP Finance Server
 
+[![CI](https://github.com/edwiniac/mcp-finance/actions/workflows/ci.yml/badge.svg)](https://github.com/edwiniac/mcp-finance/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![MCP](https://img.shields.io/badge/MCP-1.0-green.svg)](https://modelcontextprotocol.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
