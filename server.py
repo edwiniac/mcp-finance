@@ -8,16 +8,29 @@ through the Model Context Protocol (MCP).
 
 import asyncio
 import json
-from datetime import datetime, timedelta
-from typing import Any, Optional
+import logging
+import math
+from datetime import datetime, timezone
+from typing import Any
+from zoneinfo import ZoneInfo
 
 import yfinance as yf
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import TextContent, Tool
 
 # Initialize MCP server
 server = Server("mcp-finance")
+
+# Configure logging
+logger = logging.getLogger("mcp-finance")
+logger.setLevel(logging.INFO)
+
+# Constants
+VALID_PERIODS = {"1mo", "3mo", "6mo", "1y", "2y", "5y"}
+ET_TIMEZONE = ZoneInfo("America/New_York")
+MAX_PORTFOLIO_POSITIONS = 50
+SYMBOL_PATTERN_MAX_LEN = 10
 
 
 def format_number(n: float | int | None, decimals: int = 2) -> str:
@@ -38,6 +51,30 @@ def format_percent(n: float | None) -> str:
     if n is None:
         return "N/A"
     return f"{n:+.2f}%"
+
+
+def safe_divide(numerator: float, denominator: float, default: float = 0.0) -> float:
+    """Safely divide two numbers, returning default if denominator is zero or result is non-finite."""
+    if denominator == 0:
+        return default
+    result = numerator / denominator
+    if not math.isfinite(result):
+        return default
+    return result
+
+
+def validate_symbol(symbol: str) -> str:
+    """Validate and normalize a stock/crypto symbol."""
+    if not symbol or not isinstance(symbol, str):
+        raise ValueError("Symbol must be a non-empty string")
+    symbol = symbol.strip().upper()
+    if not symbol:
+        raise ValueError("Symbol must be a non-empty string")
+    if len(symbol) > SYMBOL_PATTERN_MAX_LEN:
+        raise ValueError(f"Symbol too long: {symbol!r} (max {SYMBOL_PATTERN_MAX_LEN} chars)")
+    if not all(c.isalnum() or c in "-^." for c in symbol):
+        raise ValueError(f"Invalid symbol characters: {symbol!r}")
+    return symbol
 
 
 @server.list_tools()
@@ -266,14 +303,18 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
 async def get_stock_price(symbol: str, include_history: bool = False) -> dict:
     """Get current stock price and basic info."""
-    ticker = yf.Ticker(symbol.upper())
+    symbol = validate_symbol(symbol)
+    ticker = yf.Ticker(symbol)
     info = ticker.info
 
+    price = info.get("currentPrice") or info.get("regularMarketPrice")
+    previous_close = info.get("previousClose")
+
     result = {
-        "symbol": symbol.upper(),
+        "symbol": symbol,
         "name": info.get("shortName", info.get("longName", symbol)),
-        "price": info.get("currentPrice") or info.get("regularMarketPrice"),
-        "previous_close": info.get("previousClose"),
+        "price": price,
+        "previous_close": previous_close,
         "open": info.get("open") or info.get("regularMarketOpen"),
         "day_high": info.get("dayHigh") or info.get("regularMarketDayHigh"),
         "day_low": info.get("dayLow") or info.get("regularMarketDayLow"),
@@ -286,9 +327,9 @@ async def get_stock_price(symbol: str, include_history: bool = False) -> dict:
     }
 
     # Calculate change
-    if result["price"] and result["previous_close"]:
-        change = result["price"] - result["previous_close"]
-        change_percent = (change / result["previous_close"]) * 100
+    if price and previous_close:
+        change = price - previous_close
+        change_percent = safe_divide(change, previous_close) * 100
         result["change"] = round(change, 2)
         result["change_percent"] = round(change_percent, 2)
 
@@ -310,11 +351,12 @@ async def get_stock_price(symbol: str, include_history: bool = False) -> dict:
 
 async def get_company_info(symbol: str) -> dict:
     """Get detailed company information."""
-    ticker = yf.Ticker(symbol.upper())
+    symbol = validate_symbol(symbol)
+    ticker = yf.Ticker(symbol)
     info = ticker.info
 
     return {
-        "symbol": symbol.upper(),
+        "symbol": symbol,
         "name": info.get("longName"),
         "description": info.get("longBusinessSummary"),
         "sector": info.get("sector"),
@@ -362,10 +404,13 @@ async def get_company_info(symbol: str) -> dict:
     }
 
 
-async def get_market_news(symbol: Optional[str] = None, limit: int = 5) -> dict:
+async def get_market_news(symbol: str | None = None, limit: int = 5) -> dict:
     """Get market news for a symbol or general market."""
+    limit = max(1, min(limit, 20))  # Clamp between 1 and 20
+
     if symbol:
-        ticker = yf.Ticker(symbol.upper())
+        symbol = validate_symbol(symbol)
+        ticker = yf.Ticker(symbol)
         news = ticker.news[:limit] if ticker.news else []
     else:
         # Get general market news from major index
@@ -384,7 +429,7 @@ async def get_market_news(symbol: Optional[str] = None, limit: int = 5) -> dict:
         })
 
     return {
-        "symbol": symbol.upper() if symbol else "MARKET",
+        "symbol": symbol if symbol else "MARKET",
         "count": len(articles),
         "articles": articles
     }
@@ -392,7 +437,12 @@ async def get_market_news(symbol: Optional[str] = None, limit: int = 5) -> dict:
 
 async def get_technical_analysis(symbol: str, period: str = "3mo") -> dict:
     """Get technical analysis indicators."""
-    ticker = yf.Ticker(symbol.upper())
+    symbol = validate_symbol(symbol)
+
+    if period not in VALID_PERIODS:
+        return {"error": f"Invalid period '{period}'. Must be one of: {', '.join(sorted(VALID_PERIODS))}"}
+
+    ticker = yf.Ticker(symbol)
     hist = ticker.history(period=period)
 
     if hist.empty:
@@ -406,13 +456,19 @@ async def get_technical_analysis(symbol: str, period: str = "3mo") -> dict:
     ma_50 = close.rolling(window=50).mean().iloc[-1] if len(close) >= 50 else None
     ma_200 = close.rolling(window=200).mean().iloc[-1] if len(close) >= 200 else None
 
-    # RSI calculation
+    # RSI calculation (with division-by-zero protection)
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
+    # Guard against division by zero: when loss is 0, RSI = 100
+    rs = gain / loss.replace(0, float("nan"))
     rsi = 100 - (100 / (1 + rs))
+    # Where loss was 0 (all gains), RSI should be 100
+    rsi = rsi.fillna(100.0)
     current_rsi = rsi.iloc[-1] if not rsi.empty else None
+    # Ensure RSI is a valid finite number
+    if current_rsi is not None and not math.isfinite(current_rsi):
+        current_rsi = None
 
     # MACD
     ema_12 = close.ewm(span=12, adjust=False).mean()
@@ -427,10 +483,10 @@ async def get_technical_analysis(symbol: str, period: str = "3mo") -> dict:
 
     # Volatility
     returns = close.pct_change().dropna()
-    volatility = returns.std() * (252 ** 0.5) * 100  # Annualized
+    volatility = returns.std() * (252 ** 0.5) * 100 if len(returns) > 1 else 0.0
 
-    # Trend determination
-    if ma_20 and ma_50:
+    # Trend determination (check for NaN with pandas-safe comparison)
+    if ma_20 is not None and ma_50 is not None and math.isfinite(ma_20) and math.isfinite(ma_50):
         if current_price > ma_20 > ma_50:
             trend = "Bullish"
         elif current_price < ma_20 < ma_50:
@@ -440,24 +496,30 @@ async def get_technical_analysis(symbol: str, period: str = "3mo") -> dict:
     else:
         trend = "Insufficient data"
 
+    def _safe_round(val, digits=2):
+        """Round a value safely, returning None for non-finite values."""
+        if val is None or (isinstance(val, float) and not math.isfinite(val)):
+            return None
+        return round(val, digits)
+
     return {
-        "symbol": symbol.upper(),
+        "symbol": symbol,
         "current_price": round(current_price, 2),
         "period": period,
         "trend": trend,
         "moving_averages": {
-            "ma_20": round(ma_20, 2) if ma_20 else None,
-            "ma_50": round(ma_50, 2) if ma_50 else None,
-            "ma_200": round(ma_200, 2) if ma_200 else None,
-            "price_vs_ma20": f"{((current_price/ma_20)-1)*100:+.2f}%" if ma_20 else None,
-            "price_vs_ma50": f"{((current_price/ma_50)-1)*100:+.2f}%" if ma_50 else None,
+            "ma_20": _safe_round(ma_20),
+            "ma_50": _safe_round(ma_50),
+            "ma_200": _safe_round(ma_200),
+            "price_vs_ma20": f"{safe_divide(current_price - ma_20, ma_20) * 100:+.2f}%" if ma_20 else None,
+            "price_vs_ma50": f"{safe_divide(current_price - ma_50, ma_50) * 100:+.2f}%" if ma_50 else None,
         },
         "momentum": {
-            "rsi_14": round(current_rsi, 2) if current_rsi else None,
+            "rsi_14": _safe_round(current_rsi),
             "rsi_signal": "Overbought" if current_rsi and current_rsi > 70 else "Oversold" if current_rsi and current_rsi < 30 else "Neutral",
-            "macd": round(macd_line.iloc[-1], 4) if not macd_line.empty else None,
-            "macd_signal": round(signal_line.iloc[-1], 4) if not signal_line.empty else None,
-            "macd_histogram": round(macd_histogram.iloc[-1], 4) if not macd_histogram.empty else None,
+            "macd": _safe_round(macd_line.iloc[-1], 4) if not macd_line.empty else None,
+            "macd_signal": _safe_round(signal_line.iloc[-1], 4) if not signal_line.empty else None,
+            "macd_histogram": _safe_round(macd_histogram.iloc[-1], 4) if not macd_histogram.empty else None,
         },
         "levels": {
             "resistance": round(recent_high, 2),
@@ -494,7 +556,7 @@ async def get_market_overview() -> dict:
             change_pct = None
             if price and prev_close:
                 change = price - prev_close
-                change_pct = (change / prev_close) * 100
+                change_pct = safe_divide(change, prev_close) * 100
 
             results.append({
                 "name": name,
@@ -503,24 +565,24 @@ async def get_market_overview() -> dict:
                 "change": round(change, 2) if change else None,
                 "change_percent": round(change_pct, 2) if change_pct else None,
             })
-        except Exception:
-            results.append({"name": name, "symbol": symbol, "error": "Failed to fetch"})
+        except Exception as e:
+            logger.warning("Failed to fetch index %s (%s): %s", name, symbol, e)
+            results.append({"name": name, "symbol": symbol, "error": f"Failed to fetch: {e}"})
 
-    # Market status
-    from datetime import datetime
-    now = datetime.now()
-    market_open = now.replace(hour=9, minute=30, second=0)
-    market_close = now.replace(hour=16, minute=0, second=0)
+    # Market status (using proper Eastern Time)
+    now_et = datetime.now(ET_TIMEZONE)
+    market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
 
-    if now.weekday() >= 5:
+    if now_et.weekday() >= 5:
         status = "Closed (Weekend)"
-    elif market_open <= now <= market_close:
+    elif market_open <= now_et <= market_close:
         status = "Open"
     else:
         status = "Closed"
 
     return {
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "market_status": status,
         "indices": results
     }
@@ -528,14 +590,28 @@ async def get_market_overview() -> dict:
 
 async def calculate_portfolio(positions: list[dict]) -> dict:
     """Calculate portfolio value and P&L."""
+    if not positions:
+        return {"error": "No positions provided"}
+    if len(positions) > MAX_PORTFOLIO_POSITIONS:
+        return {"error": f"Too many positions (max {MAX_PORTFOLIO_POSITIONS})"}
+
     total_value = 0
     total_cost = 0
     holdings = []
 
     for pos in positions:
-        symbol = pos["symbol"].upper()
-        shares = pos["shares"]
-        cost_basis = pos["cost_basis"]
+        try:
+            symbol = validate_symbol(pos["symbol"])
+        except (ValueError, KeyError) as e:
+            holdings.append({"symbol": pos.get("symbol", "?"), "error": str(e)})
+            continue
+
+        shares = pos.get("shares", 0)
+        cost_basis = pos.get("cost_basis", 0)
+
+        if shares <= 0:
+            holdings.append({"symbol": symbol, "error": "Shares must be positive"})
+            continue
 
         ticker = yf.Ticker(symbol)
         info = ticker.info
@@ -545,7 +621,7 @@ async def calculate_portfolio(positions: list[dict]) -> dict:
             market_value = shares * current_price
             cost_value = shares * cost_basis
             pnl = market_value - cost_value
-            pnl_pct = (pnl / cost_value) * 100
+            pnl_pct = safe_divide(pnl, cost_value) * 100
 
             total_value += market_value
             total_cost += cost_value
@@ -562,11 +638,11 @@ async def calculate_portfolio(positions: list[dict]) -> dict:
         else:
             holdings.append({
                 "symbol": symbol,
-                "error": "Could not fetch price"
+                "error": "Could not fetch current price"
             })
 
     total_pnl = total_value - total_cost
-    total_pnl_pct = (total_pnl / total_cost) * 100 if total_cost > 0 else 0
+    total_pnl_pct = safe_divide(total_pnl, total_cost) * 100
 
     return {
         "total_value": round(total_value, 2),
@@ -585,24 +661,27 @@ async def compare_stocks(symbols: list[str]) -> dict:
         symbols = symbols[:5]  # Limit to 5
 
     comparisons = []
-    for symbol in symbols:
-        ticker = yf.Ticker(symbol.upper())
+    for sym in symbols:
+        symbol = validate_symbol(sym)
+        ticker = yf.Ticker(symbol)
         info = ticker.info
         hist = ticker.history(period="1y")
 
         ytd_return = None
         if not hist.empty and len(hist) > 1:
-            ytd_return = ((hist["Close"].iloc[-1] / hist["Close"].iloc[0]) - 1) * 100
+            first_close = hist["Close"].iloc[0]
+            last_close = hist["Close"].iloc[-1]
+            ytd_return = safe_divide(last_close - first_close, first_close) * 100
 
         comparisons.append({
-            "symbol": symbol.upper(),
+            "symbol": symbol,
             "name": info.get("shortName"),
             "price": info.get("currentPrice") or info.get("regularMarketPrice"),
             "market_cap": info.get("marketCap"),
             "pe_ratio": info.get("trailingPE"),
             "forward_pe": info.get("forwardPE"),
             "dividend_yield": info.get("dividendYield"),
-            "52_week_return": round(ytd_return, 2) if ytd_return else None,
+            "52_week_return": round(ytd_return, 2) if ytd_return is not None else None,
             "sector": info.get("sector"),
             "beta": info.get("beta"),
         })
@@ -615,13 +694,14 @@ async def compare_stocks(symbols: list[str]) -> dict:
 
 async def get_crypto_price(symbol: str) -> dict:
     """Get cryptocurrency price."""
+    symbol = validate_symbol(symbol)
     # Yahoo Finance uses -USD suffix for crypto
-    crypto_symbol = f"{symbol.upper()}-USD"
+    crypto_symbol = f"{symbol}-USD"
     ticker = yf.Ticker(crypto_symbol)
     info = ticker.info
 
     return {
-        "symbol": symbol.upper(),
+        "symbol": symbol,
         "name": info.get("shortName", symbol),
         "price": info.get("regularMarketPrice"),
         "previous_close": info.get("previousClose"),
@@ -636,13 +716,15 @@ async def get_crypto_price(symbol: str) -> dict:
 
 async def get_earnings(symbol: str) -> dict:
     """Get earnings data."""
-    ticker = yf.Ticker(symbol.upper())
+    symbol = validate_symbol(symbol)
+    ticker = yf.Ticker(symbol)
 
     # Get earnings dates
     try:
         calendar = ticker.calendar
         earnings_date = calendar.get("Earnings Date", [None])[0] if calendar else None
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to fetch earnings calendar for %s: %s", symbol, e)
         earnings_date = None
 
     # Get earnings history
@@ -658,11 +740,12 @@ async def get_earnings(symbol: str) -> dict:
                     "surprise": row.get("epsDifference"),
                     "surprise_percent": row.get("surprisePercent"),
                 })
-    except Exception:
+    except Exception as e:
+        logger.warning("Failed to fetch earnings history for %s: %s", symbol, e)
         history = []
 
     return {
-        "symbol": symbol.upper(),
+        "symbol": symbol,
         "next_earnings_date": str(earnings_date) if earnings_date else None,
         "earnings_history": history
     }
@@ -715,7 +798,8 @@ async def screen_stocks(criteria: dict) -> dict:
 
             if len(matches) >= 10:  # Limit results
                 break
-        except Exception:
+        except Exception as e:
+            logger.debug("Skipping %s during screening: %s", symbol, e)
             continue
 
     return {

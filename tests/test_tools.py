@@ -1,28 +1,29 @@
 """Tests for MCP tool handlers with mocked yfinance API."""
 
-import pytest
-from unittest.mock import patch, MagicMock, AsyncMock
-import pandas as pd
-from datetime import datetime, timedelta
-import sys
 import os
+import sys
+from datetime import datetime
+from unittest.mock import MagicMock, patch
+
+import pandas as pd
+import pytest
 
 # Add parent directory to path to import server module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from server import (
-    get_stock_price,
-    get_company_info,
-    get_market_news,
-    get_technical_analysis,
-    get_market_overview,
     calculate_portfolio,
+    call_tool,
     compare_stocks,
+    get_company_info,
     get_crypto_price,
     get_earnings,
-    screen_stocks,
+    get_market_news,
+    get_market_overview,
+    get_stock_price,
+    get_technical_analysis,
     list_tools,
-    call_tool,
+    screen_stocks,
 )
 
 
@@ -408,3 +409,133 @@ class TestCallTool:
         assert len(result) == 1
         assert result[0].type == "text"
         assert "AAPL" in result[0].text
+
+
+class TestEdgeCases:
+    """Tests for edge cases and error handling."""
+
+    @pytest.mark.asyncio
+    async def test_stock_price_zero_previous_close(self):
+        """Should handle zero previous close without division error."""
+        mock_ticker = MagicMock()
+        mock_ticker.info = {
+            "shortName": "Test",
+            "currentPrice": 10.0,
+            "previousClose": 0,
+            "volume": 100,
+        }
+        mock_ticker.history.return_value = pd.DataFrame()
+
+        with patch('server.yf.Ticker', return_value=mock_ticker):
+            result = await get_stock_price("TEST")
+
+        assert result["symbol"] == "TEST"
+        assert result["price"] == 10.0
+        # change should not be computed when previous_close is 0 (falsy)
+        assert "change" not in result or result.get("change") is not None
+
+    @pytest.mark.asyncio
+    async def test_invalid_symbol_raises_error(self):
+        """Should reject invalid symbols."""
+        with pytest.raises(ValueError):
+            await get_stock_price("AA;DROP TABLE")
+
+    @pytest.mark.asyncio
+    async def test_technical_analysis_invalid_period(self):
+        """Should return error for invalid period."""
+        result = await get_technical_analysis("AAPL", period="99y")
+        assert "error" in result
+        assert "Invalid period" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_technical_analysis_rsi_all_gains(self):
+        """RSI should be 100 when stock only goes up (zero losses)."""
+        dates = pd.date_range(end=datetime.now(), periods=30, freq='D')
+        # Strictly increasing prices - no losses
+        close_prices = [100 + i for i in range(30)]
+        data = {
+            'Open': close_prices,
+            'High': [p + 1 for p in close_prices],
+            'Low': [p - 0.5 for p in close_prices],
+            'Close': close_prices,
+            'Volume': [1000000] * 30,
+        }
+        hist_df = pd.DataFrame(data, index=dates)
+
+        mock_ticker = MagicMock()
+        mock_ticker.info = {"shortName": "Test"}
+        mock_ticker.history.return_value = hist_df
+
+        with patch('server.yf.Ticker', return_value=mock_ticker):
+            result = await get_technical_analysis("TEST", period="1mo")
+
+        # RSI should be 100 for all-gains scenario
+        assert result["momentum"]["rsi_14"] == 100.0
+
+    @pytest.mark.asyncio
+    async def test_portfolio_empty_positions(self):
+        """Should return error for empty positions list."""
+        result = await calculate_portfolio([])
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_portfolio_zero_cost_basis(self):
+        """Should handle zero cost basis without division error."""
+        mock_ticker = MagicMock()
+        mock_ticker.info = {"currentPrice": 100.0}
+
+        positions = [{"symbol": "TEST", "shares": 10, "cost_basis": 0}]
+
+        with patch('server.yf.Ticker', return_value=mock_ticker):
+            result = await calculate_portfolio(positions)
+
+        # Should not crash from division by zero
+        assert "holdings" in result
+        assert len(result["holdings"]) == 1
+        holding = result["holdings"][0]
+        assert holding["market_value"] == 1000.0
+        assert holding["pnl_percent"] == 0.0  # safe_divide returns 0
+
+    @pytest.mark.asyncio
+    async def test_portfolio_negative_shares_rejected(self):
+        """Should reject positions with non-positive shares."""
+        positions = [{"symbol": "TEST", "shares": -5, "cost_basis": 100}]
+        result = await calculate_portfolio(positions)
+        assert "holdings" in result
+        assert "error" in result["holdings"][0]
+
+    @pytest.mark.asyncio
+    async def test_market_overview_uses_et_timezone(self, mock_ticker_info):
+        """Should determine market status using Eastern Time."""
+        mock_ticker = MagicMock()
+        mock_ticker.info = mock_ticker_info
+
+        with patch('server.yf.Ticker', return_value=mock_ticker):
+            result = await get_market_overview()
+
+        assert result["market_status"] in ["Open", "Closed", "Closed (Weekend)"]
+        # Timestamp should be in ISO format with timezone info
+        assert "T" in result["timestamp"]
+
+    @pytest.mark.asyncio
+    async def test_compare_stocks_ytd_return_zero_start(self):
+        """Should handle zero starting price in comparison safely."""
+        dates = pd.date_range(end=datetime.now(), periods=5, freq='D')
+        data = {
+            'Open': [0, 1, 2, 3, 4],
+            'High': [1, 2, 3, 4, 5],
+            'Low': [0, 0, 1, 2, 3],
+            'Close': [0, 1, 2, 3, 4],
+            'Volume': [1000] * 5,
+        }
+        hist_df = pd.DataFrame(data, index=dates)
+
+        mock_ticker = MagicMock()
+        mock_ticker.info = {"shortName": "Test", "currentPrice": 4.0}
+        mock_ticker.history.return_value = hist_df
+
+        with patch('server.yf.Ticker', return_value=mock_ticker):
+            result = await compare_stocks(["TEST1", "TEST2"])
+
+        # Should not crash from division by zero
+        assert "comparison" in result

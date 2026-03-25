@@ -1,9 +1,10 @@
 """Pytest fixtures for MCP Finance tests."""
 
-import pytest
-from unittest.mock import MagicMock, patch
-import pandas as pd
 from datetime import datetime, timedelta
+from unittest.mock import MagicMock
+
+import pandas as pd
+import pytest
 
 
 @pytest.fixture
